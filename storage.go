@@ -10,10 +10,10 @@ import (
 // URLRecord is the data model for a single short URL entry.
 // It is serialised to JSON for persistence and returned by the /info endpoint.
 type URLRecord struct {
-	ShortCode string    `json:"short_code"` // 6-character alphanumeric identifier
-	LongURL   string    `json:"long_url"`   // original destination URL
-	CreatedAt time.Time `json:"created_at"` // UTC timestamp of creation
-	Clicks    int64     `json:"clicks"`     // total number of redirect visits
+	ShortCode string    `json:"short_code" bson:"short_code"` // 6-character alphanumeric identifier
+	LongURL   string    `json:"long_url"   bson:"long_url"`   // original destination URL
+	CreatedAt time.Time `json:"created_at" bson:"created_at"` // UTC timestamp of creation
+	Clicks    int64     `json:"clicks"     bson:"clicks"`     // total number of redirect visits
 }
 
 // Store defines the persistence contract for URL records. Implementations must
