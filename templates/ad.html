@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Please wait... | URL Shortener</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0f0f1a;
+      color: #e0e0e0;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ── Top bar ── */
+    .topbar {
+      background: #1a1a2e;
+      border-bottom: 1px solid #2a2a45;
+      padding: 10px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-shrink: 0;
+    }
+    .topbar-brand { font-weight: 700; font-size: 1.1rem; color: #a5b4fc; }
+    .topbar-dest {
+      font-size: 0.8rem;
+      color: #888;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 400px;
+    }
+
+    /* ── Ad banner area ── */
+    .ad-banner {
+      background: linear-gradient(135deg, #1e1e3a 0%, #2a1f4a 100%);
+      border-bottom: 1px solid #2a2a45;
+      padding: 28px 24px;
+      text-align: center;
+      flex-shrink: 0;
+    }
+    .ad-label {
+      font-size: 0.65rem;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      color: #666;
+      margin-bottom: 14px;
+    }
+    .ad-content {
+      display: inline-block;
+      background: #12122a;
+      border: 1px dashed #3a3a6a;
+      border-radius: 8px;
+      padding: 30px 60px;
+      color: #888;
+      font-size: 0.9rem;
+      min-width: 728px;
+      max-width: 100%;
+    }
+    .ad-content strong { display: block; font-size: 1.3rem; color: #a5b4fc; margin-bottom: 6px; }
+    .ad-content span { font-size: 0.8rem; color: #555; }
+
+    /* ── Main content ── */
+    .main {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 40px 24px;
+    }
+    .countdown-card {
+      background: #1a1a2e;
+      border: 1px solid #2a2a45;
+      border-radius: 16px;
+      padding: 48px 56px;
+      text-align: center;
+      max-width: 480px;
+      width: 100%;
+      box-shadow: 0 8px 40px rgba(0,0,0,0.4);
+    }
+    .countdown-card h2 {
+      font-size: 1.1rem;
+      color: #aaa;
+      font-weight: 400;
+      margin-bottom: 28px;
+    }
+    .timer-ring {
+      position: relative;
+      width: 120px;
+      height: 120px;
+      margin: 0 auto 28px;
+    }
+    .timer-ring svg { transform: rotate(-90deg); }
+    .timer-ring circle {
+      fill: none;
+      stroke-width: 6;
+    }
+    .timer-ring .bg { stroke: #2a2a45; }
+    .timer-ring .progress {
+      stroke: #4f46e5;
+      stroke-linecap: round;
+      stroke-dasharray: 314;
+      stroke-dashoffset: 0;
+      transition: stroke-dashoffset 1s linear;
+    }
+    .timer-number {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      font-size: 2.4rem;
+      font-weight: 700;
+      color: #fff;
+    }
+    .dest-url {
+      font-size: 0.8rem;
+      color: #555;
+      margin-bottom: 28px;
+      word-break: break-all;
+      max-height: 40px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .skip-btn {
+      display: inline-block;
+      padding: 13px 40px;
+      background: #4f46e5;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s, opacity 0.2s;
+      text-decoration: none;
+    }
+    .skip-btn:disabled {
+      background: #2a2a45;
+      color: #555;
+      cursor: not-allowed;
+    }
+    .skip-btn:not(:disabled):hover { background: #4338ca; }
+    .progress-bar-wrap {
+      background: #2a2a45;
+      border-radius: 4px;
+      height: 4px;
+      margin-bottom: 20px;
+      overflow: hidden;
+    }
+    .progress-bar {
+      height: 100%;
+      background: #4f46e5;
+      border-radius: 4px;
+      width: 100%;
+      transition: width 1s linear;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="topbar">
+    <span class="topbar-brand">URL Shortener</span>
+    <span class="topbar-dest">Destination: {{.destinationURL}}</span>
+  </div>
+
+  <!-- Ad banner — replace this section with your real ad network code -->
+  <div class="ad-banner">
+    <div class="ad-label">Advertisement</div>
+    <div class="ad-content">
+      <strong>Your Ad Here</strong>
+      <span>Replace this block with your ad network script (Google AdSense, etc.)</span>
+    </div>
+  </div>
+
+  <div class="main">
+    <div class="countdown-card">
+      <h2>You will be redirected in</h2>
+
+      <div class="timer-ring">
+        <svg width="120" height="120" viewBox="0 0 120 120">
+          <circle class="bg" cx="60" cy="60" r="50"/>
+          <circle class="progress" id="ring" cx="60" cy="60" r="50"/>
+        </svg>
+        <div class="timer-number" id="timer-num">{{.countdown}}</div>
+      </div>
+
+      <div class="progress-bar-wrap">
+        <div class="progress-bar" id="progress-bar"></div>
+      </div>
+
+      <div class="dest-url">{{.destinationURL}}</div>
+
+      <button class="skip-btn" id="skip-btn" disabled onclick="goNow()">
+        Please wait...
+      </button>
+    </div>
+  </div>
+
+  <script>
+    // Destination URL is injected server-side — safe from client tampering.
+    // html/template auto-escapes the value inside a JS string context.
+    const destination = "{{.destinationURL}}";
+    const total = {{.countdown}};
+    let remaining = total;
+
+    const timerNum = document.getElementById('timer-num');
+    const ring = document.getElementById('ring');
+    const progressBar = document.getElementById('progress-bar');
+    const skipBtn = document.getElementById('skip-btn');
+    const circumference = 2 * Math.PI * 50; // 314.16
+
+    ring.style.strokeDasharray = circumference;
+    ring.style.strokeDashoffset = 0;
+
+    function tick() {
+      remaining--;
+
+      const fraction = remaining / total;
+      ring.style.strokeDashoffset = circumference * (1 - fraction);
+      progressBar.style.width = (fraction * 100) + '%';
+
+      if (remaining > 0) {
+        timerNum.textContent = remaining;
+        setTimeout(tick, 1000);
+      } else {
+        timerNum.textContent = '✓';
+        ring.style.stroke = '#22c55e';
+        skipBtn.disabled = false;
+        skipBtn.textContent = 'Continue to Site →';
+        progressBar.style.width = '0%';
+        progressBar.style.background = '#22c55e';
+        // Auto-redirect
+        window.location.href = destination;
+      }
+    }
+
+    function goNow() {
+      window.location.href = destination;
+    }
+
+    // Start countdown after 1 second
+    setTimeout(tick, 1000);
+  </script>
+
+</body>
+</html>
