@@ -24,13 +24,23 @@ type Config struct {
 	BaseURLOverride bool
 
 	// StorePath is the file-system path for the JSON persistence file
-	// (env: STORE_PATH, default: "urls.json").
+	// (env: STORE_PATH, default: "urls.json"). Used only when MongoURI is empty.
 	StorePath string
 
 	// AdCountdown is the number of seconds the interstitial ad page counts
 	// down before automatically forwarding the visitor (env: AD_COUNTDOWN,
 	// default: 5).
 	AdCountdown int
+
+	// MongoURI is the MongoDB connection string (env: MONGODB_URI).
+	// When set, MongoDB is used as the store instead of the JSON file.
+	MongoURI string
+
+	// MongoDB is the MongoDB database name (env: MONGODB_DB, default: "urlshortner").
+	MongoDB string
+
+	// MongoCollection is the MongoDB collection name (env: MONGODB_COLLECTION, default: "urls").
+	MongoCollection string
 }
 
 // loadConfig reads configuration from environment variables and returns a
@@ -61,12 +71,27 @@ func loadConfig() *Config {
 		storePath = "urls.json"
 	}
 
+	mongoURI := os.Getenv("MONGODB_URI")
+
+	mongoDBName := os.Getenv("MONGODB_DB")
+	if mongoDBName == "" {
+		mongoDBName = "urlshortner"
+	}
+
+	mongoCollection := os.Getenv("MONGODB_COLLECTION")
+	if mongoCollection == "" {
+		mongoCollection = "urls"
+	}
+
 	return &Config{
 		Port:            port,
 		BaseURL:         baseURL,
 		BaseURLOverride: baseURLOverride,
 		StorePath:       storePath,
 		AdCountdown:     countdown,
+		MongoURI:        mongoURI,
+		MongoDB:         mongoDBName,
+		MongoCollection: mongoCollection,
 	}
 }
 
@@ -76,9 +101,22 @@ func loadConfig() *Config {
 func main() {
 	cfg := loadConfig()
 
-	store, err := NewJSONStore(cfg.StorePath)
-	if err != nil {
-		log.Fatalf("failed to open store: %v", err)
+	var store Store
+	var storeLabel string
+	if cfg.MongoURI != "" {
+		s, err := NewMongoStore(cfg.MongoURI, cfg.MongoDB, cfg.MongoCollection)
+		if err != nil {
+			log.Fatalf("failed to connect to MongoDB: %v", err)
+		}
+		store = s
+		storeLabel = "mongodb/" + cfg.MongoDB + "/" + cfg.MongoCollection
+	} else {
+		s, err := NewJSONStore(cfg.StorePath)
+		if err != nil {
+			log.Fatalf("failed to open store: %v", err)
+		}
+		store = s
+		storeLabel = cfg.StorePath
 	}
 
 	handlers, err := NewHandlers(cfg, store)
@@ -94,7 +132,7 @@ func main() {
 		baseDisplay = "(derived from request host)"
 	}
 	log.Printf("URL Shortener running on :%s (base: %s)", cfg.Port, baseDisplay)
-	log.Printf("Ad countdown: %d seconds | Store: %s", cfg.AdCountdown, cfg.StorePath)
+	log.Printf("Ad countdown: %d seconds | Store: %s", cfg.AdCountdown, storeLabel)
 
 	if err := http.ListenAndServe(":"+cfg.Port, mux); err != nil {
 		log.Fatalf("server error: %v", err)
