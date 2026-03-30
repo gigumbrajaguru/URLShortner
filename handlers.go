@@ -14,9 +14,17 @@ var errDuplicate = errors.New("duplicate short code")
 
 const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
-// getBaseURL returns the base URL for constructing short URLs.
-// If BASE_URL was explicitly configured, that value is used.
-// Otherwise the scheme and host are derived from the incoming request.
+// getBaseURL returns the scheme+host prefix used when building short URLs.
+//
+// Priority:
+//  1. If BASE_URL was explicitly set via environment variable, that value is
+//     returned unchanged — useful for custom domains or CDN fronting.
+//  2. Otherwise the base URL is derived from the current request:
+//     a. Scheme comes from the X-Forwarded-Proto header (set by reverse proxies
+//        such as nginx/Caddy/Traefik when terminating TLS upstream).
+//     b. If the header is absent, HTTPS is used when the connection has TLS.
+//     c. Otherwise HTTP is assumed.
+//     d. The host is taken from r.Host (includes port when non-standard).
 func getBaseURL(cfg *Config, r *http.Request) string {
 	if cfg.BaseURLOverride {
 		return cfg.BaseURL
@@ -30,7 +38,9 @@ func getBaseURL(cfg *Config, r *http.Request) string {
 	return scheme + "://" + r.Host
 }
 
-// generateShortCode creates a random alphanumeric string of the given length.
+// generateShortCode creates a cryptographically random alphanumeric string of
+// the given length drawn from [a-zA-Z0-9]. It uses crypto/rand as the source
+// of entropy so the codes are unpredictable even at high volume.
 func generateShortCode(length int) string {
 	b := make([]byte, length)
 	rand.Read(b)
@@ -40,14 +50,17 @@ func generateShortCode(length int) string {
 	return string(b)
 }
 
-// Handlers holds dependencies for all HTTP handlers.
+// Handlers groups the shared dependencies injected into every HTTP handler.
+// Create one via NewHandlers and pass it to RegisterRoutes.
 type Handlers struct {
 	cfg       *Config
 	store     Store
 	templates *template.Template
 }
 
-// NewHandlers creates a Handlers instance and parses HTML templates.
+// NewHandlers creates a Handlers instance and eagerly parses all HTML
+// templates from the templates/ directory. An error is returned if any
+// template file is missing or contains a syntax error.
 func NewHandlers(cfg *Config, store Store) (*Handlers, error) {
 	tmpl, err := template.ParseGlob("templates/*.html")
 	if err != nil {
@@ -56,8 +69,9 @@ func NewHandlers(cfg *Config, store Store) (*Handlers, error) {
 	return &Handlers{cfg: cfg, store: store, templates: tmpl}, nil
 }
 
-// RegisterRoutes wires all routes onto mux.
-// Specific routes must be registered before the catch-all /{code}.
+// RegisterRoutes wires all application routes onto mux. More-specific paths
+// (e.g. /ad/{code}, /info/{code}) are registered before the catch-all
+// /{code} so that Go's ServeMux pattern matching resolves them correctly.
 func RegisterRoutes(mux *http.ServeMux, h *Handlers) {
 	mux.HandleFunc("GET /", h.IndexPage)
 	mux.HandleFunc("POST /shorten", h.ShortenURL)
@@ -66,7 +80,9 @@ func RegisterRoutes(mux *http.ServeMux, h *Handlers) {
 	mux.HandleFunc("GET /{code}", h.RedirectToAd)
 }
 
-// IndexPage renders the URL submission UI.
+// IndexPage renders the home page with the URL submission form.
+// It passes the resolved base URL to the template so the UI can display
+// a preview of what the generated short link will look like.
 func (h *Handlers) IndexPage(w http.ResponseWriter, r *http.Request) {
 	h.renderHTML(w, "index.html", http.StatusOK, map[string]any{
 		"baseURL": getBaseURL(h.cfg, r),
@@ -82,7 +98,12 @@ type shortenResponse struct {
 	ShortCode string `json:"short_code"`
 }
 
-// ShortenURL accepts {"url":"..."} and returns a short URL.
+// ShortenURL handles POST /shorten. It expects a JSON body of the form
+// {"url":"https://..."}, generates a unique 6-character short code, persists
+// the mapping, and returns {"short_url":"...","short_code":"..."}.
+//
+// The handler retries code generation up to 5 times to resolve the rare case
+// where a randomly generated code collides with an existing one.
 func (h *Handlers) ShortenURL(w http.ResponseWriter, r *http.Request) {
 	var req shortenRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.URL == "" {
@@ -121,7 +142,9 @@ func (h *Handlers) ShortenURL(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// RedirectToAd looks up the short code and redirects to the interstitial ad page.
+// RedirectToAd handles GET /{code}. It looks up the short code, increments
+// the click counter asynchronously (so the redirect is not delayed), and
+// issues a 302 redirect to the interstitial ad page at /ad/{code}.
 func (h *Handlers) RedirectToAd(w http.ResponseWriter, r *http.Request) {
 	code := r.PathValue("code")
 
@@ -144,8 +167,12 @@ func (h *Handlers) RedirectToAd(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/ad/"+code, http.StatusFound)
 }
 
-// AdPage renders the interstitial ad page with countdown timer.
-// The destination URL is injected server-side — never in a query parameter.
+// AdPage handles GET /ad/{code}. It renders the interstitial ad page that
+// counts down before forwarding the visitor to the destination URL.
+//
+// The destination URL is looked up server-side and injected directly into the
+// template — it is never passed as a query parameter. This prevents open
+// redirect abuse and ensures the URL is properly escaped by html/template.
 func (h *Handlers) AdPage(w http.ResponseWriter, r *http.Request) {
 	code := r.PathValue("code")
 
@@ -177,7 +204,9 @@ type infoResponse struct {
 	Clicks    int64  `json:"clicks"`
 }
 
-// GetInfo returns JSON metadata about a short URL.
+// GetInfo handles GET /info/{code}. It returns a JSON object with metadata
+// about the short link: the original long URL, the constructed short URL,
+// the creation timestamp (ISO 8601 / UTC), and the total click count.
 func (h *Handlers) GetInfo(w http.ResponseWriter, r *http.Request) {
 	code := r.PathValue("code")
 
