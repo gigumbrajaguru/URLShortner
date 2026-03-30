@@ -9,10 +9,11 @@ import (
 
 // Config holds all runtime configuration loaded from environment variables.
 type Config struct {
-	Port        string
-	BaseURL     string
-	StorePath   string
-	AdCountdown int
+	Port            string
+	BaseURL         string
+	BaseURLOverride bool // true when BASE_URL env var was explicitly set
+	StorePath       string
+	AdCountdown     int
 }
 
 func loadConfig() *Config {
@@ -29,9 +30,7 @@ func loadConfig() *Config {
 	}
 
 	baseURL := os.Getenv("BASE_URL")
-	if baseURL == "" {
-		baseURL = "http://localhost:" + port
-	}
+	baseURLOverride := baseURL != ""
 
 	storePath := os.Getenv("STORE_PATH")
 	if storePath == "" {
@@ -39,10 +38,11 @@ func loadConfig() *Config {
 	}
 
 	return &Config{
-		Port:        port,
-		BaseURL:     baseURL,
-		StorePath:   storePath,
-		AdCountdown: countdown,
+		Port:            port,
+		BaseURL:         baseURL,
+		BaseURLOverride: baseURLOverride,
+		StorePath:       storePath,
+		AdCountdown:     countdown,
 	}
 }
 
@@ -62,7 +62,11 @@ func main() {
 	mux := http.NewServeMux()
 	RegisterRoutes(mux, handlers)
 
-	log.Printf("URL Shortener running on :%s (base: %s)", cfg.Port, cfg.BaseURL)
+	baseDisplay := cfg.BaseURL
+	if !cfg.BaseURLOverride {
+		baseDisplay = "(derived from request host)"
+	}
+	log.Printf("URL Shortener running on :%s (base: %s)", cfg.Port, baseDisplay)
 	log.Printf("Ad countdown: %d seconds | Store: %s", cfg.AdCountdown, cfg.StorePath)
 
 	if err := http.ListenAndServe(":"+cfg.Port, mux); err != nil {

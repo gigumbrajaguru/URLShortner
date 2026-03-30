@@ -14,6 +14,22 @@ var errDuplicate = errors.New("duplicate short code")
 
 const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
+// getBaseURL returns the base URL for constructing short URLs.
+// If BASE_URL was explicitly configured, that value is used.
+// Otherwise the scheme and host are derived from the incoming request.
+func getBaseURL(cfg *Config, r *http.Request) string {
+	if cfg.BaseURLOverride {
+		return cfg.BaseURL
+	}
+	scheme := "http"
+	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+		scheme = proto
+	} else if r.TLS != nil {
+		scheme = "https"
+	}
+	return scheme + "://" + r.Host
+}
+
 // generateShortCode creates a random alphanumeric string of the given length.
 func generateShortCode(length int) string {
 	b := make([]byte, length)
@@ -53,7 +69,7 @@ func RegisterRoutes(mux *http.ServeMux, h *Handlers) {
 // IndexPage renders the URL submission UI.
 func (h *Handlers) IndexPage(w http.ResponseWriter, r *http.Request) {
 	h.renderHTML(w, "index.html", http.StatusOK, map[string]any{
-		"baseURL": h.cfg.BaseURL,
+		"baseURL": getBaseURL(h.cfg, r),
 	})
 }
 
@@ -100,7 +116,7 @@ func (h *Handlers) ShortenURL(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(shortenResponse{
-		ShortURL:  h.cfg.BaseURL + "/" + code,
+		ShortURL:  getBaseURL(h.cfg, r) + "/" + code,
 		ShortCode: code,
 	})
 }
@@ -116,7 +132,7 @@ func (h *Handlers) RedirectToAd(w http.ResponseWriter, r *http.Request) {
 	}
 	if record == nil {
 		h.renderHTML(w, "index.html", http.StatusNotFound, map[string]any{
-			"baseURL": h.cfg.BaseURL,
+			"baseURL": getBaseURL(h.cfg, r),
 			"error":   "Short URL not found",
 		})
 		return
@@ -140,7 +156,7 @@ func (h *Handlers) AdPage(w http.ResponseWriter, r *http.Request) {
 	}
 	if record == nil {
 		h.renderHTML(w, "index.html", http.StatusNotFound, map[string]any{
-			"baseURL": h.cfg.BaseURL,
+			"baseURL": getBaseURL(h.cfg, r),
 			"error":   "Short URL not found",
 		})
 		return
@@ -179,7 +195,7 @@ func (h *Handlers) GetInfo(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(infoResponse{
 		ShortCode: record.ShortCode,
 		LongURL:   record.LongURL,
-		ShortURL:  h.cfg.BaseURL + "/" + record.ShortCode,
+		ShortURL:  getBaseURL(h.cfg, r) + "/" + record.ShortCode,
 		CreatedAt: record.CreatedAt.Format("2006-01-02T15:04:05Z"),
 		Clicks:    record.Clicks,
 	})
