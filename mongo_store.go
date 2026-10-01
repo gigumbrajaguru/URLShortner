@@ -10,6 +10,10 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
+// mongoOpTimeout bounds every MongoDB operation whose context has no earlier
+// deadline, so a slow or unreachable server can never hang a request.
+const mongoOpTimeout = 5 * time.Second
+
 // MongoStore is a MongoDB-backed implementation of the Store interface.
 // It is safe for concurrent use by multiple goroutines.
 type MongoStore struct {
@@ -18,17 +22,26 @@ type MongoStore struct {
 }
 
 // NewMongoStore connects to MongoDB at uri, ensures a unique index exists on
-// the short_code field, and returns a ready-to-use MongoStore. Returns an
-// error if the connection or ping fails within 10 seconds.
-func NewMongoStore(uri, dbName, collectionName string) (*MongoStore, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	client, err := mongo.Connect(options.Client().ApplyURI(uri))
+// the short_code field, and returns a ready-to-use MongoStore. ctx bounds the
+// connection check and index creation; on failure the client is disconnected.
+func NewMongoStore(ctx context.Context, uri, dbName, collectionName string) (*MongoStore, error) {
+	client, err := mongo.Connect(options.Client().ApplyURI(uri).SetTimeout(mongoOpTimeout))
 	if err != nil {
 		return nil, err
 	}
 
+	s, err := initMongoStore(ctx, client, dbName, collectionName)
+	if err != nil {
+		// Use a fresh context: ctx may be the one that just expired.
+		disconnectCtx, cancel := context.WithTimeout(context.Background(), mongoOpTimeout)
+		defer cancel()
+		_ = client.Disconnect(disconnectCtx)
+		return nil, err
+	}
+	return s, nil
+}
+
+func initMongoStore(ctx context.Context, client *mongo.Client, dbName, collectionName string) (*MongoStore, error) {
 	if err := client.Ping(ctx, nil); err != nil {
 		return nil, err
 	}
@@ -49,15 +62,13 @@ func NewMongoStore(uri, dbName, collectionName string) (*MongoStore, error) {
 
 // Save inserts a new short_code → long_url mapping.
 // Returns errDuplicate if the short code already exists.
-func (s *MongoStore) Save(shortCode, longURL string) error {
+func (s *MongoStore) Save(ctx context.Context, shortCode, longURL string) error {
 	doc := URLRecord{
 		ShortCode: shortCode,
 		LongURL:   longURL,
 		CreatedAt: time.Now().UTC(),
-		Clicks:    0,
 	}
-	_, err := s.collection.InsertOne(context.Background(), doc)
-	if err != nil {
+	if _, err := s.collection.InsertOne(ctx, doc); err != nil {
 		if mongo.IsDuplicateKeyError(err) {
 			return errDuplicate
 		}
@@ -68,10 +79,10 @@ func (s *MongoStore) Save(shortCode, longURL string) error {
 
 // GetByCode retrieves a URLRecord by its short code.
 // Returns (nil, nil) when the code does not exist.
-func (s *MongoStore) GetByCode(shortCode string) (*URLRecord, error) {
+func (s *MongoStore) GetByCode(ctx context.Context, shortCode string) (*URLRecord, error) {
 	filter := bson.D{{Key: "short_code", Value: shortCode}}
 	var record URLRecord
-	err := s.collection.FindOne(context.Background(), filter).Decode(&record)
+	err := s.collection.FindOne(ctx, filter).Decode(&record)
 	if errors.Is(err, mongo.ErrNoDocuments) {
 		return nil, nil
 	}
@@ -81,25 +92,24 @@ func (s *MongoStore) GetByCode(shortCode string) (*URLRecord, error) {
 	return &record, nil
 }
 
-// IncrementClicks atomically increments the click counter for a short code.
-// It is a no-op if the code does not exist.
-func (s *MongoStore) IncrementClicks(shortCode string) error {
+// IncrementClicks atomically increments the click counter for a short code
+// and reports whether the code exists.
+func (s *MongoStore) IncrementClicks(ctx context.Context, shortCode string) (bool, error) {
 	filter := bson.D{{Key: "short_code", Value: shortCode}}
 	update := bson.D{{Key: "$inc", Value: bson.D{{Key: "clicks", Value: int64(1)}}}}
-	_, err := s.collection.UpdateOne(context.Background(), filter, update)
-	return err
+	res, err := s.collection.UpdateOne(ctx, filter, update)
+	if err != nil {
+		return false, err
+	}
+	return res.MatchedCount > 0, nil
 }
 
-// GetAll returns a snapshot of all stored URL records.
-func (s *MongoStore) GetAll() []URLRecord {
-	cursor, err := s.collection.Find(context.Background(), bson.D{})
-	if err != nil {
-		return nil
-	}
-	defer cursor.Close(context.Background())
-	var records []URLRecord
-	if err := cursor.All(context.Background(), &records); err != nil {
-		return nil
-	}
-	return records
+// Ping checks that the MongoDB primary is reachable.
+func (s *MongoStore) Ping(ctx context.Context) error {
+	return s.client.Ping(ctx, nil)
+}
+
+// Close disconnects from MongoDB.
+func (s *MongoStore) Close(ctx context.Context) error {
+	return s.client.Disconnect(ctx)
 }

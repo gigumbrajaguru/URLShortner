@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Please wait... | URL Shortener</title>
+  <noscript><meta http-equiv="refresh" content="{{.Countdown}};url={{.DestinationURL}}"></noscript>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -23,15 +24,17 @@
       display: flex;
       align-items: center;
       justify-content: space-between;
+      gap: 16px;
       flex-shrink: 0;
     }
-    .topbar-brand { font-weight: 700; font-size: 1.1rem; color: #a5b4fc; }
+    .topbar-brand { font-weight: 700; font-size: 1.1rem; color: #a5b4fc; white-space: nowrap; }
     .topbar-dest {
       font-size: 0.8rem;
       color: #888;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
+      min-width: 0;
       max-width: 400px;
     }
 
@@ -55,10 +58,10 @@
       background: #12122a;
       border: 1px dashed #3a3a6a;
       border-radius: 8px;
-      padding: 30px 60px;
+      padding: 30px 24px;
       color: #888;
       font-size: 0.9rem;
-      min-width: 728px;
+      width: 728px;
       max-width: 100%;
     }
     .ad-content strong { display: block; font-size: 1.3rem; color: #a5b4fc; margin-bottom: 6px; }
@@ -158,13 +161,20 @@
       width: 100%;
       transition: width 1s linear;
     }
+    .noscript-link { color: #a5b4fc; }
+    @media (max-width: 480px) {
+      .topbar { padding: 10px 16px; }
+      .ad-banner { padding: 20px 16px; }
+      .main { padding: 24px 16px; }
+      .countdown-card { padding: 32px 20px; }
+    }
   </style>
 </head>
 <body>
 
   <div class="topbar">
     <span class="topbar-brand">URL Shortener</span>
-    <span class="topbar-dest">Destination: {{.destinationURL}}</span>
+    <span class="topbar-dest">Destination: {{.DestinationURL}}</span>
   </div>
 
   <!-- Ad banner — replace this section with your real ad network code -->
@@ -185,26 +195,29 @@
           <circle class="bg" cx="60" cy="60" r="50"/>
           <circle class="progress" id="ring" cx="60" cy="60" r="50"/>
         </svg>
-        <div class="timer-number" id="timer-num">{{.countdown}}</div>
+        <div class="timer-number" id="timer-num">{{.Countdown}}</div>
       </div>
 
       <div class="progress-bar-wrap">
         <div class="progress-bar" id="progress-bar"></div>
       </div>
 
-      <div class="dest-url">{{.destinationURL}}</div>
+      <div class="dest-url">{{.DestinationURL}}</div>
 
       <button class="skip-btn" id="skip-btn" disabled onclick="goNow()">
         Please wait...
       </button>
+      <noscript>
+        <p><a class="noscript-link" href="{{.DestinationURL}}">Continue to site</a></p>
+      </noscript>
     </div>
   </div>
 
   <script>
     // Destination URL is injected server-side — safe from client tampering.
-    // html/template auto-escapes the value inside a JS string context.
-    const destination = "{{.destinationURL}}";
-    const total = {{.countdown}};
+    // html/template renders the value as a properly escaped JS string literal.
+    const destination = {{.DestinationURL}};
+    const total = {{.Countdown}};
     let remaining = total;
 
     const timerNum = document.getElementById('timer-num');

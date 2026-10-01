@@ -1,0 +1,9 @@
+.git
+.github
+.idea
+*.md
+*_test.go
+urlshortner
+urls.json
+urls.json.tmp-*
+data/

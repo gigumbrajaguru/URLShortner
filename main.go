@@ -1,21 +1,35 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
+	"os/signal"
 	"strconv"
+	"strings"
+	"syscall"
+	"time"
+	_ "time/tzdata" // embedded zone database, so TIMEZONE works in minimal containers
 )
+
+// shutdownTimeout bounds how long in-flight requests and the final store
+// flush may take after SIGINT/SIGTERM.
+const shutdownTimeout = 10 * time.Second
 
 // Config holds all runtime configuration loaded from environment variables.
 // Each field maps to a corresponding environment variable; see loadConfig for defaults.
 type Config struct {
-	// Port is the TCP port the HTTP server listens on (env: PORT, default: "8080").
+	// Port is the TCP port the HTTP server listens on (env: PORT, default: "8182").
 	Port string
 
 	// BaseURL is the scheme+host prefix used when constructing short URLs
-	// (env: BASE_URL). When BaseURLOverride is false this field is empty and
-	// the base URL is derived from each incoming request instead.
+	// (env: BASE_URL), without a trailing slash. When BaseURLOverride is
+	// false this field is empty and the base URL is derived from each
+	// incoming request instead.
 	BaseURL string
 
 	// BaseURLOverride is true when the BASE_URL environment variable was
@@ -41,100 +55,157 @@ type Config struct {
 
 	// MongoCollection is the MongoDB collection name (env: MONGODB_COLLECTION, default: "urls").
 	MongoCollection string
+
+	// Location is the time zone for timestamps in API responses and logs
+	// (env: TIMEZONE, an IANA name, default: "Asia/Colombo"). Records are
+	// always stored in UTC.
+	Location *time.Location
 }
 
 // loadConfig reads configuration from environment variables and returns a
-// populated Config. Missing or invalid values fall back to sensible defaults:
+// populated Config. Unset variables fall back to sensible defaults:
 //
-//   - PORT          → "8080"
-//   - BASE_URL      → derived per-request from the Host header (no static default)
-//   - STORE_PATH    → "urls.json"
-//   - AD_COUNTDOWN  → 5 seconds
-func loadConfig() *Config {
-	countdown := 5
+//   - PORT                → "8182"
+//   - BASE_URL            → derived per-request from the Host header (no static default)
+//   - STORE_PATH          → "urls.json"
+//   - AD_COUNTDOWN        → 5 seconds (also used, with a warning, for invalid values)
+//   - TIMEZONE            → "Asia/Colombo"
+//   - MONGODB_URI         → unset (use the JSON file store)
+//   - MONGODB_DB          → "urlshortner"
+//   - MONGODB_COLLECTION  → "urls"
+//
+// An invalid BASE_URL or TIMEZONE is an error, since either would produce
+// wrong links or timestamps on every request.
+func loadConfig() (*Config, error) {
+	cfg := &Config{
+		Port:            envOr("PORT", "8182"),
+		StorePath:       envOr("STORE_PATH", "urls.json"),
+		AdCountdown:     5,
+		MongoURI:        os.Getenv("MONGODB_URI"),
+		MongoDB:         envOr("MONGODB_DB", "urlshortner"),
+		MongoCollection: envOr("MONGODB_COLLECTION", "urls"),
+	}
+
 	if v := os.Getenv("AD_COUNTDOWN"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			countdown = n
+			cfg.AdCountdown = n
+		} else {
+			log.Printf("warning: AD_COUNTDOWN=%q is not a positive integer; using %d", v, cfg.AdCountdown)
 		}
 	}
 
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8182"
+	if v := os.Getenv("BASE_URL"); v != "" {
+		u, err := url.Parse(v)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return nil, fmt.Errorf("BASE_URL must be an absolute http(s) URL such as https://sho.rt, got %q", v)
+		}
+		cfg.BaseURL = strings.TrimRight(v, "/")
+		cfg.BaseURLOverride = true
 	}
 
-	baseURL := os.Getenv("BASE_URL")
-	baseURLOverride := baseURL != ""
-
-	storePath := os.Getenv("STORE_PATH")
-	if storePath == "" {
-		storePath = "urls.json"
+	loc, err := time.LoadLocation(envOr("TIMEZONE", "Asia/Colombo"))
+	if err != nil {
+		return nil, fmt.Errorf("TIMEZONE: %w", err)
 	}
+	cfg.Location = loc
 
-	mongoURI := os.Getenv("MONGODB_URI")
-
-	mongoDBName := os.Getenv("MONGODB_DB")
-	if mongoDBName == "" {
-		mongoDBName = "urlshortner"
-	}
-
-	mongoCollection := os.Getenv("MONGODB_COLLECTION")
-	if mongoCollection == "" {
-		mongoCollection = "urls"
-	}
-
-	return &Config{
-		Port:            port,
-		BaseURL:         baseURL,
-		BaseURLOverride: baseURLOverride,
-		StorePath:       storePath,
-		AdCountdown:     countdown,
-		MongoURI:        mongoURI,
-		MongoDB:         mongoDBName,
-		MongoCollection: mongoCollection,
-	}
+	return cfg, nil
 }
 
-// main loads configuration, initialises the persistent store and HTTP handlers,
-// registers all routes, and starts the HTTP server. The process exits with a
-// non-zero status if any initialisation step fails.
-func main() {
-	cfg := loadConfig()
+// envOr returns the value of the environment variable key, or def when it is
+// unset or empty.
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
 
-	var store Store
-	var storeLabel string
+// openStore returns the MongoDB store when MONGODB_URI is set and the JSON
+// file store otherwise, along with a label describing it for the startup log.
+func openStore(cfg *Config) (Store, string, error) {
 	if cfg.MongoURI != "" {
-		s, err := NewMongoStore(cfg.MongoURI, cfg.MongoDB, cfg.MongoCollection)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		s, err := NewMongoStore(ctx, cfg.MongoURI, cfg.MongoDB, cfg.MongoCollection)
 		if err != nil {
-			log.Fatalf("failed to connect to MongoDB: %v", err)
+			return nil, "", fmt.Errorf("connect to MongoDB: %w", err)
 		}
-		store = s
-		storeLabel = "mongodb/" + cfg.MongoDB + "/" + cfg.MongoCollection
-	} else {
-		s, err := NewJSONStore(cfg.StorePath)
-		if err != nil {
-			log.Fatalf("failed to open store: %v", err)
-		}
-		store = s
-		storeLabel = cfg.StorePath
+		return s, "mongodb/" + cfg.MongoDB + "/" + cfg.MongoCollection, nil
+	}
+	s, err := NewJSONStore(cfg.StorePath)
+	if err != nil {
+		return nil, "", fmt.Errorf("open store: %w", err)
+	}
+	return s, cfg.StorePath, nil
+}
+
+// run loads configuration, opens the store, and serves HTTP until the server
+// fails or the process receives SIGINT/SIGTERM. On shutdown it lets in-flight
+// requests finish and flushes/closes the store.
+func run() error {
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	// Log timestamps use the configured zone too. Safe: no other goroutines yet.
+	time.Local = cfg.Location
+
+	store, storeLabel, err := openStore(cfg)
+	if err != nil {
+		return err
 	}
 
 	handlers, err := NewHandlers(cfg, store)
 	if err != nil {
-		log.Fatalf("failed to load templates: %v", err)
+		store.Close(context.Background())
+		return fmt.Errorf("load templates: %w", err)
 	}
 
-	mux := http.NewServeMux()
-	RegisterRoutes(mux, handlers)
+	srv := &http.Server{
+		Addr:              ":" + cfg.Port,
+		Handler:           handlers.Routes(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 
 	baseDisplay := cfg.BaseURL
 	if !cfg.BaseURLOverride {
 		baseDisplay = "(derived from request host)"
 	}
 	log.Printf("URL Shortener running on :%s (base: %s)", cfg.Port, baseDisplay)
-	log.Printf("Ad countdown: %d seconds | Store: %s", cfg.AdCountdown, storeLabel)
+	log.Printf("Ad countdown: %d seconds | Store: %s | Time zone: %s", cfg.AdCountdown, storeLabel, cfg.Location)
 
-	if err := http.ListenAndServe(":"+cfg.Port, mux); err != nil {
-		log.Fatalf("server error: %v", err)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.ListenAndServe() }()
+
+	select {
+	case err = <-errCh:
+		err = fmt.Errorf("server error: %w", err)
+	case <-ctx.Done():
+		stop() // restore default handling so a second Ctrl+C exits immediately
+		log.Print("shutting down")
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	if serr := srv.Shutdown(shutdownCtx); serr != nil && !errors.Is(serr, http.ErrServerClosed) {
+		err = errors.Join(err, fmt.Errorf("shutdown: %w", serr))
+	}
+	if cerr := store.Close(shutdownCtx); cerr != nil {
+		err = errors.Join(err, fmt.Errorf("close store: %w", cerr))
+	}
+	return err
+}
+
+// main runs the application and exits with a non-zero status on failure.
+func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
 	}
 }
