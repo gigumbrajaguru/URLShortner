@@ -1,2 +1,4 @@
 urlshortner
 urls.json
+urls.json.tmp-*
+data/

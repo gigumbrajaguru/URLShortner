@@ -1,11 +1,21 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
 	"os"
+	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+// errDuplicate is returned by Store.Save when the short code already exists.
+var errDuplicate = errors.New("duplicate short code")
 
 // URLRecord is the data model for a single short URL entry.
 // It is serialised to JSON for persistence and returned by the /info endpoint.
@@ -21,92 +31,121 @@ type URLRecord struct {
 type Store interface {
 	// Save persists a new shortCode → longURL mapping. Returns errDuplicate
 	// if the short code is already in use.
-	Save(shortCode, longURL string) error
+	Save(ctx context.Context, shortCode, longURL string) error
 
 	// GetByCode retrieves the record for a short code.
 	// Returns (nil, nil) when the code does not exist.
-	GetByCode(shortCode string) (*URLRecord, error)
+	GetByCode(ctx context.Context, shortCode string) (*URLRecord, error)
 
 	// IncrementClicks atomically increments the click counter for a short
-	// code. It is a no-op (returns nil) if the code does not exist.
-	IncrementClicks(shortCode string) error
+	// code and reports whether the code exists.
+	IncrementClicks(ctx context.Context, shortCode string) (bool, error)
 
-	// GetAll returns a snapshot of every stored record in arbitrary order.
-	GetAll() []URLRecord
+	// Ping reports whether the store is usable; it backs the health check.
+	Ping(ctx context.Context) error
+
+	// Close flushes any pending writes and releases resources.
+	Close(ctx context.Context) error
 }
 
+// flushInterval is how often JSONStore persists click-count changes. New
+// links are written immediately; clicks are batched so a popular link does
+// not rewrite the whole file on every visit.
+const flushInterval = time.Second
+
 // JSONStore is a thread-safe, in-memory Store backed by a JSON file on disk.
-// All records are kept in a map for O(1) lookups; writes are flushed to the
-// file immediately so data survives restarts. It is suitable for low-to-medium
-// traffic; for high-volume deployments swap in a database-backed implementation
-// of the Store interface without modifying any handler code.
+// All records are kept in a map for O(1) lookups. New links are written to
+// disk before Save returns; click counts are flushed in the background every
+// flushInterval and on Close. Files are replaced atomically (write to a temp
+// file, then rename) so a crash never leaves a truncated store behind.
+//
+// It is suitable for low-to-medium traffic; for high-volume deployments use
+// MongoStore or another implementation of the Store interface.
 type JSONStore struct {
-	mu       sync.RWMutex
-	records  map[string]*URLRecord
+	mu      sync.RWMutex
+	records map[string]*URLRecord
+	version uint64 // bumped on every mutation; guarded by mu
+
+	fileMu   sync.Mutex    // serialises writes to filePath
+	written  atomic.Uint64 // version of the snapshot last written to disk
 	filePath string
+
+	stop      chan struct{}
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 // NewJSONStore opens the JSON store at filePath, loading any previously saved
-// records into memory. If the file does not exist it is created on the first
-// write. Returns an error if the file exists but cannot be read or parsed.
+// records into memory. Missing parent directories and the file itself are
+// created immediately, so permission problems surface at startup rather than
+// as failed requests later. Returns an error if the file cannot be read,
+// parsed, or written.
 func NewJSONStore(filePath string) (*JSONStore, error) {
 	s := &JSONStore{
 		records:  make(map[string]*URLRecord),
+		version:  1, // ahead of written, so the startup flush below always writes
 		filePath: filePath,
+		stop:     make(chan struct{}),
+		done:     make(chan struct{}),
 	}
 
 	data, err := os.ReadFile(filePath)
-	if err != nil && !os.IsNotExist(err) {
-		return nil, err
-	}
-	if err == nil {
-		var list []URLRecord
-		if err := json.Unmarshal(data, &list); err != nil {
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
 			return nil, err
 		}
+	case err != nil:
+		return nil, err
+	case len(bytes.TrimSpace(data)) > 0:
+		var list []URLRecord
+		if err := json.Unmarshal(data, &list); err != nil {
+			return nil, fmt.Errorf("parse %s: %w", filePath, err)
+		}
 		for i := range list {
-			r := list[i]
-			s.records[r.ShortCode] = &r
+			s.records[list[i].ShortCode] = &list[i]
 		}
 	}
 
+	if err := s.flush(); err != nil {
+		return nil, fmt.Errorf("write %s: %w", filePath, err)
+	}
+
+	go s.flushLoop()
 	return s, nil
 }
 
-// save writes the current state to disk. Must be called with the write lock held.
-func (s *JSONStore) save() error {
-	list := make([]URLRecord, 0, len(s.records))
-	for _, r := range s.records {
-		list = append(list, *r)
-	}
-	data, err := json.MarshalIndent(list, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(s.filePath, data, 0644)
-}
-
-// Save inserts a new short code → long URL mapping.
-// Returns errDuplicate if the short code already exists.
-func (s *JSONStore) Save(shortCode, longURL string) error {
+// Save inserts a new short code → long URL mapping and writes it to disk
+// before returning. Returns errDuplicate if the short code already exists.
+// If the write fails the record is removed again, so memory never serves a
+// link that was not persisted.
+func (s *JSONStore) Save(_ context.Context, shortCode, longURL string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if _, exists := s.records[shortCode]; exists {
+		s.mu.Unlock()
 		return errDuplicate
 	}
-
 	s.records[shortCode] = &URLRecord{
 		ShortCode: shortCode,
 		LongURL:   longURL,
-		CreatedAt: time.Now(),
-		Clicks:    0,
+		CreatedAt: time.Now().UTC(),
 	}
-	return s.save()
+	s.version++
+	list, version := s.snapshotLocked()
+	s.mu.Unlock()
+
+	if err := s.writeSnapshot(list, version); err != nil {
+		s.mu.Lock()
+		delete(s.records, shortCode)
+		s.version++
+		s.mu.Unlock()
+		return err
+	}
+	return nil
 }
 
 // GetByCode retrieves a URLRecord by its short code. Returns nil, nil if not found.
-func (s *JSONStore) GetByCode(shortCode string) (*URLRecord, error) {
+func (s *JSONStore) GetByCode(_ context.Context, shortCode string) (*URLRecord, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -114,31 +153,121 @@ func (s *JSONStore) GetByCode(shortCode string) (*URLRecord, error) {
 	if !ok {
 		return nil, nil
 	}
-	copy := *r
-	return &copy, nil
+	rec := *r
+	return &rec, nil
 }
 
-// IncrementClicks increments the click counter for a short code.
-func (s *JSONStore) IncrementClicks(shortCode string) error {
+// IncrementClicks increments the click counter for a short code and reports
+// whether it exists. The new count is persisted by the background flusher.
+func (s *JSONStore) IncrementClicks(_ context.Context, shortCode string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	r, ok := s.records[shortCode]
 	if !ok {
-		return nil
+		return false, nil
 	}
 	r.Clicks++
-	return s.save()
+	s.version++
+	return true, nil
 }
 
-// GetAll returns a snapshot of all URL records.
-func (s *JSONStore) GetAll() []URLRecord {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+// Ping always succeeds: the store lives in memory and write failures are
+// reported by Save itself.
+func (s *JSONStore) Ping(context.Context) error { return nil }
 
+// Close stops the background flusher and writes any pending changes.
+// It is safe to call more than once.
+func (s *JSONStore) Close(context.Context) error {
+	s.closeOnce.Do(func() { close(s.stop) })
+	<-s.done
+	return s.flush()
+}
+
+// flushLoop periodically persists changes until Close is called.
+func (s *JSONStore) flushLoop() {
+	defer close(s.done)
+	ticker := time.NewTicker(flushInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.stop:
+			return
+		case <-ticker.C:
+			if err := s.flush(); err != nil {
+				log.Printf("json store: flush %s: %v", s.filePath, err)
+			}
+		}
+	}
+}
+
+// flush writes the current state to disk if it changed since the last write.
+func (s *JSONStore) flush() error {
+	s.mu.RLock()
+	if s.version == s.written.Load() {
+		s.mu.RUnlock()
+		return nil
+	}
+	list, version := s.snapshotLocked()
+	s.mu.RUnlock()
+	return s.writeSnapshot(list, version)
+}
+
+// snapshotLocked copies every record so it can be encoded without holding
+// the lock. The caller must hold s.mu.
+func (s *JSONStore) snapshotLocked() ([]URLRecord, uint64) {
 	list := make([]URLRecord, 0, len(s.records))
 	for _, r := range s.records {
 		list = append(list, *r)
 	}
-	return list
+	return list, s.version
+}
+
+// writeSnapshot persists a snapshot taken at the given version. A snapshot
+// holds every mutation up to its version, so one that is not newer than the
+// file already on disk is skipped: that file covers it.
+func (s *JSONStore) writeSnapshot(list []URLRecord, version uint64) error {
+	s.fileMu.Lock()
+	defer s.fileMu.Unlock()
+
+	if version <= s.written.Load() {
+		return nil
+	}
+	data, err := json.Marshal(list)
+	if err != nil {
+		return err
+	}
+	if err := writeFileAtomic(s.filePath, data); err != nil {
+		return err
+	}
+	s.written.Store(version)
+	return nil
+}
+
+// writeFileAtomic replaces path with data via a synced temp file and a
+// rename, so readers and crashes only ever see the old or the new content.
+func writeFileAtomic(path string, data []byte) error {
+	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp) // no-op once the rename succeeds
+
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Chmod(0o644); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
