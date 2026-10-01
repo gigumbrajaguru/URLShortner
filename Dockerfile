@@ -1,8 +1,13 @@
 # syntax=docker/dockerfile:1
 
 # ---- build ----
-FROM golang:1.24-alpine AS build
+FROM golang:1.25-alpine AS build
 WORKDIR /src
+
+# Official Go images set GOTOOLCHAIN=local, which fails the build whenever
+# go.mod (e.g. after a Dependabot bump) asks for a newer Go than the image
+# ships. "auto" downloads the toolchain go.mod requires instead.
+ENV GOTOOLCHAIN=auto
 
 COPY go.mod go.sum ./
 RUN go mod download
