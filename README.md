@@ -148,7 +148,7 @@ URLShortner/
 
 ## Development
 
-**Prerequisites:** Go 1.24.7 or later.
+**Prerequisites:** Go 1.25 or later.
 
 ```bash
 # Build
